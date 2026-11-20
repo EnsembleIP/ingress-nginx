@@ -1,0 +1,225 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Build the patched controller (nginx 1.31.9, QD-10940) and push it to the
+# staging / production ECR repos. AWS auth is OIDC via the existing
+# ensembleip-github-actions-deploy role (allowlisted in ensembleip-infra
+# terraform by repo:EnsembleIP/ingress-nginx:environment:<env>).
+name: Build and push images to ECR
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "AWS environment to push to"
+        required: true
+        type: choice
+        options: [staging, production]
+
+permissions:
+  contents: read
+  id-token: write # OIDC token for AWS AssumeRole + cosign keyless signing
+
+concurrency:
+  group: build-ecr
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # Digest-pinned upstream kube-webhook-certgen from the infra runbook.
+  CERTGEN_REF: registry.k8s.io/ingress-nginx/kube-webhook-certgen:v1.6.9@sha256:01038e7de14b78d70d2849c3aad72fd25903c4765af63cf16aa3398f5d5f2df
+
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      go_version: ${{ steps.ver.outputs.go_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          short="${GITHUB_SHA::7}"
+          echo "version=v$(cat TAG)-nginx-1.31.9-eip.${short}" >> "$GITHUB_OUTPUT"
+          echo "go_version=$(cat GOLANG_VERSION)" >> "$GITHUB_OUTPUT"
+
+  # Pushes to the staging account on every push to the default branch, and on
+  # explicit dispatch. The production job must be dispatched manually.
+  push-staging:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.environment == 'staging')
+    needs: resolve
+    environment: staging
+    runs-on: ubuntu-24.04
+    env:
+      ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID_STAGING || '339652154195' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/ensembleip-github-actions-deploy
+          role-session-name: ingress-nginx-ci
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Cache nginx base build
+        uses: actions/cache@v4
+        with:
+          path: .buildx-cache
+          key: nginx-base-${{ hashFiles('images/nginx/rootfs/**') }}
+          restore-keys: nginx-base-
+      - name: Build nginx base (nginx 1.31.9, all sources sha256-verified)
+        uses: docker/build-push-action@v6
+        with:
+          context: images/nginx/rootfs
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: local/nginx-base:build
+          cache-from: type=local,src=.buildx-cache
+          cache-to: type=local,dest=.buildx-cache,mode=max
+      - name: Verify nginx version in base
+        run: docker run --rm local/nginx-base:build nginx -v 2>&1 | grep -q 'nginx/1.31.9'
+      - name: Build controller binaries
+        run: |
+          docker run --rm -v "$PWD":/work -w /work \
+            -e PKG=k8s.io/ingress-nginx -e ARCH=amd64 -e CGO_ENABLED=0 \
+            -e GOFLAGS=-buildvcs=false \
+            -e TAG='${{ needs.resolve.outputs.version }}' \
+            -e COMMIT_SHA="$GITHUB_SHA" \
+            -e REPO_INFO="https://github.com/${GITHUB_REPOSITORY}" \
+            golang:${{ needs.resolve.outputs.go_version }}-alpine3.23 \
+            /bin/sh build/build.sh
+      - name: Build and push controller image
+        id: controller
+        uses: docker/build-push-action@v6
+        with:
+          context: rootfs
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}
+          build-args: |
+            BASE_IMAGE=local/nginx-base:build
+            VERSION=${{ needs.resolve.outputs.version }}
+            TARGETARCH=amd64
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_ID=${{ github.run_id }}
+      - name: Mirror kube-webhook-certgen to ECR
+        run: |
+          docker pull -q "$CERTGEN_REF"
+          docker tag "${CERTGEN_REF%%@*}" "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
+          docker push "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
+      - name: Sign images (cosign keyless) and attach SBOM
+        run: |
+          curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
+          for repo in ingress-nginx-controller ingress-nginx-certgen; do
+            digest=$(aws ecr describe-images --repository-name "$repo" \
+              --image-ids imageTag="$([ "$repo" = ingress-nginx-controller ] && echo '${{ needs.resolve.outputs.version }}' || echo v1.6.9)" \
+              --query 'imageDetails[0].imageDigest' --output text)
+            img="${{ steps.ecr.outputs.registry }}/$repo@$digest"
+            cosign sign -y "$img"
+            docker sbom "$img" --output-format=spdx --silent > sbom.spdx.json
+            cosign attest -y --predicate sbom.spdx.json --type spdx "$img"
+          done
+      - name: Write digest summary (for terraform.tfvars)
+        run: |
+          digest=$(aws ecr describe-images --repository-name ingress-nginx-controller \
+            --image-ids imageTag='${{ needs.resolve.outputs.version }}' \
+            --query 'imageDetails[0].imageDigest' --output text)
+          {
+            echo "## tfvars snippet"
+            echo '```'
+            echo "ingress_controller_image = { staging = \"${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}@$digest\" }"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  push-production:
+    if: github.event_name == 'workflow_dispatch' && inputs.environment == 'production'
+    needs: resolve
+    environment: production
+    runs-on: ubuntu-24.04
+    env:
+      ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID_PRODUCTION || '851725459092' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/ensembleip-github-actions-deploy
+          role-session-name: ingress-nginx-ci
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - name: Cache nginx base build
+        uses: actions/cache@v4
+        with:
+          path: .buildx-cache
+          key: nginx-base-${{ hashFiles('images/nginx/rootfs/**') }}
+          restore-keys: nginx-base-
+      - name: Build nginx base
+        uses: docker/build-push-action@v6
+        with:
+          context: images/nginx/rootfs
+          load: true
+          push: false
+          platforms: linux/amd64
+          tags: local/nginx-base:build
+          cache-from: type=local,src=.buildx-cache
+          cache-to: type=local,dest=.buildx-cache,mode=max
+      - name: Verify nginx version in base
+        run: docker run --rm local/nginx-base:build nginx -v 2>&1 | grep -q 'nginx/1.31.9'
+      - name: Build controller binaries
+        run: |
+          docker run --rm -v "$PWD":/work -w /work \
+            -e PKG=k8s.io/ingress-nginx -e ARCH=amd64 -e CGO_ENABLED=0 \
+            -e GOFLAGS=-buildvcs=false \
+            -e TAG='${{ needs.resolve.outputs.version }}' \
+            -e COMMIT_SHA="$GITHUB_SHA" \
+            -e REPO_INFO="https://github.com/${GITHUB_REPOSITORY}" \
+            golang:${{ needs.resolve.outputs.go_version }}-alpine3.23 \
+            /bin/sh build/build.sh
+      - name: Build and push controller image
+        uses: docker/build-push-action@v6
+        with:
+          context: rootfs
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}
+          build-args: |
+            BASE_IMAGE=local/nginx-base:build
+            VERSION=${{ needs.resolve.outputs.version }}
+            TARGETARCH=amd64
+            COMMIT_SHA=${{ github.sha }}
+            BUILD_ID=${{ github.run_id }}
+      - name: Mirror kube-webhook-certgen to ECR
+        run: |
+          docker pull -q "$CERTGEN_REF"
+          docker tag "${CERTGEN_REF%%@*}" "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
+          docker push "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
+      - name: Write digest summary (for terraform.tfvars)
+        run: |
+          digest=$(aws ecr describe-images --repository-name ingress-nginx-controller \
+            --image-ids imageTag='${{ needs.resolve.outputs.version }}' \
+            --query 'imageDetails[0].imageDigest' --output text)
+          {
+            echo "## tfvars snippet"
+            echo '```'
+            echo "ingress_controller_image = { production = \"${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}@$digest\" }"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
