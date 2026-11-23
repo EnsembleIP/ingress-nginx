@@ -68,10 +68,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-        with:
-          # Use the Docker daemon store so the nginx-base image built with
-          # load: true is visible when the controller image is built and pushed.
-          driver: docker
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -111,18 +107,19 @@ jobs:
             /bin/sh build/build.sh
       - name: Build and push controller image
         id: controller
-        uses: docker/build-push-action@v6
-        with:
-          context: rootfs
-          push: true
-          platforms: linux/amd64
-          tags: ${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}
-          build-args: |
-            BASE_IMAGE=local/nginx-base:build
-            VERSION=${{ needs.resolve.outputs.version }}
-            TARGETARCH=amd64
-            COMMIT_SHA=${{ github.sha }}
-            BUILD_ID=${{ github.run_id }}
+        # Classic builder on purpose: the nginx base was imported into the
+        # docker image store (buildx load: true). The buildx builder's own
+        # containerd cannot see it as a FROM base.
+        run: |
+          IMG="${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}"
+          docker build --platform linux/amd64 \
+            --build-arg BASE_IMAGE=local/nginx-base:build \
+            --build-arg VERSION='${{ needs.resolve.outputs.version }}' \
+            --build-arg TARGETARCH=amd64 \
+            --build-arg COMMIT_SHA='${{ github.sha }}' \
+            --build-arg BUILD_ID='${{ github.run_id }}' \
+            -t "$IMG" rootfs
+          docker push "$IMG"
       - name: Mirror kube-webhook-certgen to ECR
         run: |
           docker pull -q "$CERTGEN_REF"
@@ -162,8 +159,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-        with:
-          driver: docker
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::${{ env.ACCOUNT_ID }}:role/ensembleip-github-actions-deploy
@@ -201,23 +196,36 @@ jobs:
             golang:${{ needs.resolve.outputs.go_version }}-alpine3.23 \
             /bin/sh build/build.sh
       - name: Build and push controller image
-        uses: docker/build-push-action@v6
-        with:
-          context: rootfs
-          push: true
-          platforms: linux/amd64
-          tags: ${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}
-          build-args: |
-            BASE_IMAGE=local/nginx-base:build
-            VERSION=${{ needs.resolve.outputs.version }}
-            TARGETARCH=amd64
-            COMMIT_SHA=${{ github.sha }}
-            BUILD_ID=${{ github.run_id }}
+        # Classic builder on purpose: the nginx base was imported into the
+        # docker image store (buildx load: true). The buildx builder's own
+        # containerd cannot see it as a FROM base.
+        run: |
+          IMG="${{ steps.ecr.outputs.registry }}/ingress-nginx-controller:${{ needs.resolve.outputs.version }}"
+          docker build --platform linux/amd64 \
+            --build-arg BASE_IMAGE=local/nginx-base:build \
+            --build-arg VERSION='${{ needs.resolve.outputs.version }}' \
+            --build-arg TARGETARCH=amd64 \
+            --build-arg COMMIT_SHA='${{ github.sha }}' \
+            --build-arg BUILD_ID='${{ github.run_id }}' \
+            -t "$IMG" rootfs
+          docker push "$IMG"
       - name: Mirror kube-webhook-certgen to ECR
         run: |
           docker pull -q "$CERTGEN_REF"
           docker tag "${CERTGEN_REF%%@*}" "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
           docker push "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
+      - name: Sign images (cosign keyless) and attach SBOM
+        run: |
+          curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
+          for repo in ingress-nginx-controller ingress-nginx-certgen; do
+            digest=$(aws ecr describe-images --repository-name "$repo" \
+              --image-ids imageTag="$([ "$repo" = ingress-nginx-controller ] && echo '${{ needs.resolve.outputs.version }}' || echo v1.6.9)" \
+              --query 'imageDetails[0].imageDigest' --output text)
+            img="${{ steps.ecr.outputs.registry }}/$repo@$digest"
+            cosign sign -y "$img"
+            docker sbom "$img" --output-format=spdx --silent > sbom.spdx.json
+            cosign attest -y --predicate sbom.spdx.json --type spdx "$img"
+          done
       - name: Write digest summary (for terraform.tfvars)
         run: |
           digest=$(aws ecr describe-images --repository-name ingress-nginx-controller \
