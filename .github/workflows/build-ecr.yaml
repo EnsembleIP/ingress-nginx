@@ -122,9 +122,11 @@ jobs:
           docker push "$IMG"
       - name: Mirror kube-webhook-certgen to ECR
         run: |
-          docker pull -q "$CERTGEN_REF"
-          docker tag "${CERTGEN_REF%%@*}" "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
-          docker push "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
+          # Registry-to-registry copy by digest: no local tag needed, and the
+          # full multi-arch manifest list (same digest as upstream) is preserved.
+          docker buildx imagetools create \
+            -t "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9" \
+            "$CERTGEN_REF"
       - name: Sign images (cosign keyless) and attach SBOM
         run: |
           curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
@@ -211,9 +213,11 @@ jobs:
           docker push "$IMG"
       - name: Mirror kube-webhook-certgen to ECR
         run: |
-          docker pull -q "$CERTGEN_REF"
-          docker tag "${CERTGEN_REF%%@*}" "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
-          docker push "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9"
+          # Registry-to-registry copy by digest: no local tag needed, and the
+          # full multi-arch manifest list (same digest as upstream) is preserved.
+          docker buildx imagetools create \
+            -t "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9" \
+            "$CERTGEN_REF"
       - name: Sign images (cosign keyless) and attach SBOM
         run: |
           curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
