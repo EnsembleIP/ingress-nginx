@@ -53,7 +53,8 @@ jobs:
       - id: ver
         run: |
           short="${GITHUB_SHA::7}"
-          echo "version=v$(cat TAG)-nginx-1.31.9-eip.${short}" >> "$GITHUB_OUTPUT"
+          # TAG already starts with "v"; do not prefix another one.
+          echo "version=$(cat TAG)-nginx-1.31.9-eip.${short}" >> "$GITHUB_OUTPUT"
           echo "go_version=$(cat GOLANG_VERSION)" >> "$GITHUB_OUTPUT"
 
   # Pushes to the staging account on every push to the default branch, and on
@@ -119,31 +120,32 @@ jobs:
             --build-arg COMMIT_SHA='${{ github.sha }}' \
             --build-arg BUILD_ID='${{ github.run_id }}' \
             -t "$IMG" rootfs
-          docker push "$IMG"
+          # Capture the pushed digest from docker's own output: the deploy role
+          # has no ecr:DescribeImages permission, and signing what we just
+          # pushed is exactly right anyway.
+          docker push "$IMG" 2>&1 | tee /tmp/controller-push.log
+          echo "CONTROLLER_DIGEST=$(awk '/digest: sha256:/{for(i=1;i<=NF;i++) if($i ~ /^sha256:[0-9a-f]+$/) print $i}' /tmp/controller-push.log)" >> "$GITHUB_ENV"
       - name: Mirror kube-webhook-certgen to ECR
         run: |
           # Registry-to-registry copy by digest: no local tag needed, and the
           # full multi-arch manifest list (same digest as upstream) is preserved.
           docker buildx imagetools create \
             -t "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9" \
-            "$CERTGEN_REF"
+            "$CERTGEN_REF" 2>&1 | tee /tmp/certgen-push.log
+          echo "CERTGEN_DIGEST=$(awk '/pushing sha256:/{for(i=1;i<=NF;i++) if($i ~ /^sha256:/) print $i}' /tmp/certgen-push.log)" >> "$GITHUB_ENV"
       - name: Sign images (cosign keyless) and attach SBOM
         run: |
           curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
-          for repo in ingress-nginx-controller ingress-nginx-certgen; do
-            digest=$(aws ecr describe-images --repository-name "$repo" \
-              --image-ids imageTag="$([ "$repo" = ingress-nginx-controller ] && echo '${{ needs.resolve.outputs.version }}' || echo v1.6.9)" \
-              --query 'imageDetails[0].imageDigest' --output text)
-            img="${{ steps.ecr.outputs.registry }}/$repo@$digest"
+          for img in \
+            "${{ steps.ecr.outputs.registry }}/ingress-nginx-controller@$CONTROLLER_DIGEST" \
+            "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen@$CERTGEN_DIGEST"; do
             cosign sign -y "$img"
             docker sbom "$img" --output-format=spdx --silent > sbom.spdx.json
             cosign attest -y --predicate sbom.spdx.json --type spdx "$img"
           done
       - name: Write digest summary (for terraform.tfvars)
         run: |
-          digest=$(aws ecr describe-images --repository-name ingress-nginx-controller \
-            --image-ids imageTag='${{ needs.resolve.outputs.version }}' \
-            --query 'imageDetails[0].imageDigest' --output text)
+          digest=$CONTROLLER_DIGEST
           {
             echo "## tfvars snippet"
             echo '```'
@@ -210,31 +212,32 @@ jobs:
             --build-arg COMMIT_SHA='${{ github.sha }}' \
             --build-arg BUILD_ID='${{ github.run_id }}' \
             -t "$IMG" rootfs
-          docker push "$IMG"
+          # Capture the pushed digest from docker's own output: the deploy role
+          # has no ecr:DescribeImages permission, and signing what we just
+          # pushed is exactly right anyway.
+          docker push "$IMG" 2>&1 | tee /tmp/controller-push.log
+          echo "CONTROLLER_DIGEST=$(awk '/digest: sha256:/{for(i=1;i<=NF;i++) if($i ~ /^sha256:[0-9a-f]+$/) print $i}' /tmp/controller-push.log)" >> "$GITHUB_ENV"
       - name: Mirror kube-webhook-certgen to ECR
         run: |
           # Registry-to-registry copy by digest: no local tag needed, and the
           # full multi-arch manifest list (same digest as upstream) is preserved.
           docker buildx imagetools create \
             -t "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen:v1.6.9" \
-            "$CERTGEN_REF"
+            "$CERTGEN_REF" 2>&1 | tee /tmp/certgen-push.log
+          echo "CERTGEN_DIGEST=$(awk '/pushing sha256:/{for(i=1;i<=NF;i++) if($i ~ /^sha256:/) print $i}' /tmp/certgen-push.log)" >> "$GITHUB_ENV"
       - name: Sign images (cosign keyless) and attach SBOM
         run: |
           curl -sSL -o /usr/local/bin/cosign https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x /usr/local/bin/cosign
-          for repo in ingress-nginx-controller ingress-nginx-certgen; do
-            digest=$(aws ecr describe-images --repository-name "$repo" \
-              --image-ids imageTag="$([ "$repo" = ingress-nginx-controller ] && echo '${{ needs.resolve.outputs.version }}' || echo v1.6.9)" \
-              --query 'imageDetails[0].imageDigest' --output text)
-            img="${{ steps.ecr.outputs.registry }}/$repo@$digest"
+          for img in \
+            "${{ steps.ecr.outputs.registry }}/ingress-nginx-controller@$CONTROLLER_DIGEST" \
+            "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen@$CERTGEN_DIGEST"; do
             cosign sign -y "$img"
             docker sbom "$img" --output-format=spdx --silent > sbom.spdx.json
             cosign attest -y --predicate sbom.spdx.json --type spdx "$img"
           done
       - name: Write digest summary (for terraform.tfvars)
         run: |
-          digest=$(aws ecr describe-images --repository-name ingress-nginx-controller \
-            --image-ids imageTag='${{ needs.resolve.outputs.version }}' \
-            --query 'imageDetails[0].imageDigest' --output text)
+          digest=$CONTROLLER_DIGEST
           {
             echo "## tfvars snippet"
             echo '```'
