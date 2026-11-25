@@ -143,7 +143,7 @@ jobs:
             "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen@$CERTGEN_DIGEST"; do
             cosign sign -y "$img"
             syft "registry:$img" --output spdx-json=sbom.spdx.json
-            cosign attest -y --predicate sbom.spdx.json --type spdx "$img"
+            cosign attest -y --predicate sbom.spdx.json --type spdxjson "$img"
           done
       - name: Write digest summary (for terraform.tfvars)
         run: |
@@ -237,7 +237,7 @@ jobs:
             "${{ steps.ecr.outputs.registry }}/ingress-nginx-certgen@$CERTGEN_DIGEST"; do
             cosign sign -y "$img"
             syft "registry:$img" --output spdx-json=sbom.spdx.json
-            cosign attest -y --predicate sbom.spdx.json --type spdx "$img"
+            cosign attest -y --predicate sbom.spdx.json --type spdxjson "$img"
           done
       - name: Write digest summary (for terraform.tfvars)
         run: |
